@@ -1,0 +1,38 @@
+name: License Check
+
+on:
+  push:
+    paths:
+      - 'src/**'
+  pull_request:
+    paths:
+      - 'src/**'
+
+jobs:
+  license-check:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    - name: Check Rust license headers
+      run: |
+        set -euo pipefail
+
+        LICENSE_FILE=".github/license_header.rs"
+        MISSING=0
+
+        while IFS= read -r file; do
+          if ! head -n "$(wc -l < "$LICENSE_FILE")" "$file" | diff -q - "$LICENSE_FILE" > /dev/null; then
+            echo "❌ Missing or incorrect license in: $file"
+            MISSING=1
+          fi
+        done < <(find src/ -name "*.rs")
+
+        if [ $MISSING -eq 1 ]; then
+          echo "Some files are missing the correct license header."
+          exit 1
+        else
+          echo "✅ All files have the correct license header."
+        fi
