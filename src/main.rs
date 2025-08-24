@@ -34,7 +34,6 @@ enum GitBrustError {
     MissingInputBranches,
 }
 
-const UNUSED: bool = true;
 
 fn main() -> Result<(), GitBrustError> {
     // Initialize the logger
