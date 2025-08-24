@@ -19,11 +19,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 use env_logger::Builder;
 use git2::{Commit, Oid, Repository};
 use indexmap::IndexMap;
+use itertools::Itertools;
 use log::{error, info, trace};
 use std::collections::HashSet;
 use thiserror::Error;
-
-const DEBUG_BRANCHES: bool = true;
 
 #[derive(Debug, Error)]
 enum GitBrustError {
@@ -32,7 +31,14 @@ enum GitBrustError {
 
     #[error("no branches provided. Usage: git-brust <base> <compare>")]
     MissingInputBranches,
+
+    #[error("merge-base not found in first-parent commit chain of current branches")]
+    MergeBaseError,
 }
+
+const DEBUG_BRANCHES: bool = true;
+
+type BranchFPChain = IndexMap<String, Vec<Oid>>;
 
 fn main() -> Result<(), GitBrustError> {
     // Initialize the logger
@@ -46,8 +52,97 @@ fn main() -> Result<(), GitBrustError> {
     info!("Branches to use: {}", branches.join(", "));
 
     let branch_fp_commit_chains = get_unique_fp_commits_chain(&repo, branches)?;
-    print_branch_commits(&branch_fp_commit_chains)?;
+    print_branch_commits(&repo, &branch_fp_commit_chains)?;
 
+    calculate_fp_relations(&repo, &branch_fp_commit_chains)?;
+
+    Ok(())
+}
+
+fn calculate_fp_relations(
+    repo: &Repository,
+    fp_chains: &BranchFPChain,
+) -> Result<(), GitBrustError> {
+    for pair in fp_chains.iter().combinations(2) {
+        let (branch_1, commits_branch_1) = pair[0];
+        let (branch_2, commits_branch_2) = pair[1];
+
+        trace!("Pair: {} <-> {}", branch_1, branch_2);
+
+        // We have the fp chains
+        //commits_branch_1
+        //commits_branch_2
+
+        // Create two indexes to iterate the two fp chains
+        let mut i = 0;
+        let mut j = 0;
+
+        while i < commits_branch_1.len() && j < commits_branch_2.len() {
+            // Get the ids from that indexes
+            let oid1 = commits_branch_1[i];
+            let oid2 = commits_branch_2[j];
+
+            // Find merge base
+            let merge_base_oid = repo.merge_base(oid1, oid2)?;
+            info!("  merge-base id: {:?}", merge_base_oid);
+
+            // See wich branch does not contains the merge base
+            // Note: really only one contains is needed, but doing both just in case as a debug
+            let idx_b1 = commits_branch_1[i..]
+                .iter()
+                .position(|oid| oid.eq(&merge_base_oid));
+            let idx_b2 = commits_branch_2[j..]
+                .iter()
+                .position(|oid| oid.eq(&merge_base_oid));
+            let (oids_slice, idx_to_iterate) = match (idx_b1, idx_b2) {
+                (Some(idx_b1), None) => {
+                    trace!(
+                        "merge-base is in branch 1: {}, oid: {}, idx: {}",
+                        branch_1, merge_base_oid, idx_b1
+                    );
+                    // Should be invariant but just in case
+                    assert!(idx_b1 >= i);
+                    i = idx_b1; // Move the index to the merge-base
+                    // Save the slice to be iterated and the used index (from the branch that does not contain the merge-base)
+                    (&commits_branch_2[j..], &mut j)
+                }
+                (None, Some(idx_b2)) => {
+                    trace!(
+                        "merge-base is in branch 2: {}, oid: {}, idx: {}",
+                        branch_2, merge_base_oid, idx_b2
+                    );
+                    // Should be invariant but just in case
+                    assert!(idx_b2 >= j);
+                    j = idx_b2; // Move the index to the merge-base
+                    // Save the slice to be iterated and the used index (from the branch that does not contain the merge-base)
+                    (&commits_branch_1[i..], &mut i)
+                }
+                _ => return Err(GitBrustError::MergeBaseError),
+            };
+
+            let mut merge_base_merge_commit_oid: Option<&Oid> = None;
+            // Iterate over the commits from the branch that do not include the merge base
+            for oit_comm in oids_slice {
+                trace!("Oid from non merge-base branch: {}", oit_comm);
+                // Check if the merge base is still the same
+                let new_merge_base_oid = repo.merge_base(merge_base_oid, *oit_comm)?;
+                if new_merge_base_oid != merge_base_oid {
+                    trace!(
+                        "New merge base found: {} -> {}",
+                        merge_base_oid, new_merge_base_oid
+                    );
+                    info!(
+                        "Merge base merge commit: {}",
+                        merge_base_merge_commit_oid.unwrap()
+                    );
+                    break;
+                } else {
+                    merge_base_merge_commit_oid = Some(oit_comm);
+                }
+                *idx_to_iterate += 1;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -76,27 +171,25 @@ fn resolve_branch_to_commit<'repo>(
     Ok(current_commit)
 }
 
-type BranchFPChain<'repo> = IndexMap<String, Vec<Commit<'repo>>>;
-
-fn get_unique_fp_commits_chain<'repo>(
-    repo: &'repo Repository,
+fn get_unique_fp_commits_chain(
+    repo: &Repository,
     branches_names: Vec<String>,
-) -> Result<BranchFPChain<'repo>, git2::Error> {
+) -> Result<BranchFPChain, git2::Error> {
     // Map each branch name to its first-parent commit chain.
-    let mut first_parent_chains: IndexMap<String, Vec<Commit>> = IndexMap::new();
+    let mut first_parent_chains: IndexMap<String, Vec<Oid>> = IndexMap::new();
     // Track commit IDs to ensure each commit is processed only once across branches.
     let mut seen_ids: HashSet<Oid> = HashSet::new();
 
     // Process each branch by resolving its commit chain following first parents.
     for branch in branches_names {
-        let mut chain: Vec<Commit> = Vec::new();
+        let mut chain: Vec<Oid> = Vec::new();
         let mut current = resolve_branch_to_commit(repo, &branch)?;
 
         // Traverse the first-parent chain until reaching an already seen commit or there is no parent commit.
         while seen_ids.insert(current.id()) {
             let parent = current.parent(0);
             // Add the current commit to the result chain.
-            chain.push(current);
+            chain.push(current.id());
             // Update current to its first parent, if available.
             current = match parent {
                 Ok(parent) => parent,
@@ -104,21 +197,26 @@ fn get_unique_fp_commits_chain<'repo>(
             };
         }
         // Add the chain to the map.
-        first_parent_chains.insert(branch.to_string(), chain);
+        first_parent_chains.insert(branch, chain);
     }
     Ok(first_parent_chains)
 }
 
 /// Print branch names and their commits (short IDs).
 fn print_branch_commits<'repo>(
-    branches: &IndexMap<String, Vec<Commit<'repo>>>,
+    repo: &Repository,
+    branches: &BranchFPChain,
 ) -> Result<(), git2::Error> {
-    for (branch, commits) in branches {
+    for (branch, ids) in branches {
         println!("Branch: {}", branch);
-        for commit in commits {
+        for id in ids {
             println!(
                 "  {}",
-                commit.as_object().short_id()?.as_str().unwrap_or("?")
+                repo.find_commit(*id)?
+                    .as_object()
+                    .short_id()?
+                    .as_str()
+                    .unwrap_or("?")
             );
         }
     }
