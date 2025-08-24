@@ -5,5 +5,8 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 
 [dependencies]
+env_logger = "0.11.8"
 git2 = "0.20.2"
 indexmap = "2.10.0"
+log = "0.4.27"
+thiserror = "2.0.16"

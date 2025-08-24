@@ -14,31 +14,58 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use env_logger::Builder;
 use git2::{Commit, Oid, Repository};
 use indexmap::IndexMap;
+use log::{error, info, trace};
 use std::collections::HashSet;
+use thiserror::Error;
 
-fn main() -> Result<(), git2::Error> {
-    // Git repository from path.
+const DEBUG_BRANCHES: bool = true;
+
+#[derive(Debug, Error)]
+enum GitBrustError {
+    #[error("git error: {0}")]
+    Git(#[from] git2::Error),
+
+    #[error("no branches provided. Usage: git-brust <base> <compare>")]
+    MissingInputBranches,
+}
+
+fn main() -> Result<(), GitBrustError> {
+    // Initialize the logger
+    Builder::new().filter_level(log::LevelFilter::Trace).init();
+
+    // Open git repository
     let repo = Repository::open(".")?;
-    // List of branches. Later will be passed as program parameter.
-    let branch_names = vec!["master", "develop"];
 
-    let branch_fp_commit_chains = get_unique_fp_commits_chain(&repo, &branch_names)?;
+    // Parse branch names from the program arguments
+    let branches = get_branches_from_args()?;
+    info!("Branches to use: {}", branches.join(", "));
+
+    let branch_fp_commit_chains = get_unique_fp_commits_chain(&repo, branches)?;
     print_branch_commits(&branch_fp_commit_chains)?;
 
     Ok(())
 }
 
-/// Resolves a branch name to its tip commit.
-///
-/// Attempts to resolve the provided branch name (e.g., "main", "origin/feature")
-/// into a commit object, peeling tags or annotated references as needed.
-///
-/// \param repo        Git repository to operate on.
-/// \param branch_name Name of the branch (or any valid revspec).
-/// \return            Resolved commit object.
-/// \throws git2::Error If the reference or commit cannot be resolved.
+fn get_branches_from_args() -> Result<Vec<String>, GitBrustError> {
+    let args: Vec<String> = std::env::args().skip(1).collect(); // Skip the executable name
+
+    if args.is_empty() {
+        if DEBUG_BRANCHES {
+            let branches = vec!["master".to_string(), "develop".to_string()];
+            trace!("No input branches, using default: {}", branches.join(", "));
+            Ok(branches)
+        } else {
+            Err(GitBrustError::MissingInputBranches)
+        }
+    } else {
+        trace!("Branches from args: {:?}", args);
+        Ok(args)
+    }
+}
+
 fn resolve_branch_to_commit<'repo>(
     repo: &'repo Repository,
     branch_name: &str,
@@ -49,19 +76,9 @@ fn resolve_branch_to_commit<'repo>(
 
 type BranchFPChain<'repo> = IndexMap<String, Vec<Commit<'repo>>>;
 
-/// Builds a mapping from branch names to their unique first-parent commit chains.
-///
-/// For each provided branch, this function traverses its history following only the
-/// first parent of each commit, collecting the chain of commits that are unique
-/// (i.e., not shared with the first-parent chains of previously processed branches).
-///
-/// \param repo         Git repository to operate on.
-/// \param branch_names List of branch names to process.
-/// \return             Map from branch name to a vector of unique first-parent commits.
-/// \throws git2::Error If resolving any branch or commit fails.
 fn get_unique_fp_commits_chain<'repo>(
     repo: &'repo Repository,
-    branch_names: &[&str],
+    branches_names: Vec<String>,
 ) -> Result<BranchFPChain<'repo>, git2::Error> {
     // Map each branch name to its first-parent commit chain.
     let mut first_parent_chains: IndexMap<String, Vec<Commit>> = IndexMap::new();
@@ -69,9 +86,9 @@ fn get_unique_fp_commits_chain<'repo>(
     let mut seen_ids: HashSet<Oid> = HashSet::new();
 
     // Process each branch by resolving its commit chain following first parents.
-    for &branch in branch_names {
+    for branch in branches_names {
         let mut chain: Vec<Commit> = Vec::new();
-        let mut current = resolve_branch_to_commit(repo, branch)?;
+        let mut current = resolve_branch_to_commit(repo, &branch)?;
 
         // Traverse the first-parent chain until reaching an already seen commit or there is no parent commit.
         while seen_ids.insert(current.id()) {
