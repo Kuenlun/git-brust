@@ -74,10 +74,16 @@ impl<'repo> DerefMut for FPChain<'repo> {
     }
 }
 
+enum RelationType {
+    Birth,
+    Merge,
+}
+
 /// Relation between commits from two first-parent chains
 struct Relation<'repo> {
     src: Oid,
     dst: Oid,
+    rel_type: RelationType,
     repo: &'repo Repository, // Used only for printing short commit IDs
 }
 
@@ -86,6 +92,11 @@ impl<'repo> fmt::Display for Relation<'repo> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let short_id_base = self.repo.short_id_str(self.src);
         let short_id_merge = self.repo.short_id_str(self.dst);
+
+        match self.rel_type {
+            RelationType::Merge => write!(f, "Merge: ")?,
+            RelationType::Birth => write!(f, "Birth: ")?,
+        }
         write!(f, "{} -> {}", short_id_base, short_id_merge)
     }
 }
@@ -225,16 +236,12 @@ fn detect_relation<'repo>(
     let mut previous_oid = *first;
 
     for (i, current_oid) in rest.iter().enumerate() {
-        trace!(
-            "Oid from non merge-base branch: {}",
-            repo.short_id_str(*current_oid)
-        );
-
         if let Ok(new_merge_base) = repo.merge_base(merge_base_oid, *current_oid) {
             if new_merge_base != merge_base_oid {
                 let relation = Relation {
                     src: merge_base_oid,
                     dst: previous_oid,
+                    rel_type: RelationType::Merge,
                     repo,
                 };
                 debug!(
@@ -252,6 +259,7 @@ fn detect_relation<'repo>(
     let relation = Relation {
         src: merge_base_oid,
         dst: previous_oid,
+        rel_type: RelationType::Birth,
         repo,
     };
     debug!(
