@@ -21,7 +21,7 @@ use git2::{Commit, Oid, Repository};
 use indexmap::IndexMap;
 use itertools::Itertools;
 use log::{error, info, trace};
-use std::collections::HashSet;
+use std::{collections::HashSet, vec};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -42,7 +42,7 @@ type BranchFPChain = IndexMap<String, Vec<Oid>>;
 
 fn main() -> Result<(), GitBrustError> {
     // Initialize the logger
-    Builder::new().filter_level(log::LevelFilter::Trace).init();
+    Builder::new().filter_level(log::LevelFilter::Info).init();
 
     // Open git repository
     let repo = Repository::open(".")?;
@@ -59,6 +59,25 @@ fn main() -> Result<(), GitBrustError> {
     Ok(())
 }
 
+/// Extension trait for Repository
+pub trait RepositoryExt {
+    fn short_id_str(&self, oid: Oid) -> String;
+}
+
+impl RepositoryExt for Repository {
+    fn short_id_str(&self, oid: Oid) -> String {
+        let obj = match self.find_object(oid, None) {
+            Ok(o) => o,
+            Err(_) => return "?".to_string(),
+        };
+        let short_id = match obj.short_id() {
+            Ok(s) => s,
+            Err(_) => return "?".to_string(),
+        };
+        short_id.as_str().unwrap_or("?").to_string()
+    }
+}
+
 fn calculate_fp_relations(
     repo: &Repository,
     fp_chains: &BranchFPChain,
@@ -68,10 +87,6 @@ fn calculate_fp_relations(
         let (branch_2, commits_branch_2) = pair[1];
 
         trace!("Pair: {} <-> {}", branch_1, branch_2);
-
-        // We have the fp chains
-        //commits_branch_1
-        //commits_branch_2
 
         // Create two indexes to iterate the two fp chains
         let mut i = 0;
@@ -84,62 +99,86 @@ fn calculate_fp_relations(
 
             // Find merge base
             let merge_base_oid = repo.merge_base(oid1, oid2)?;
-            info!("  merge-base id: {:?}", merge_base_oid);
+            trace!("  merge-base id: {:?}", repo.short_id_str(merge_base_oid));
 
             // See wich branch does not contains the merge base
-            // Note: really only one contains is needed, but doing both just in case as a debug
-            let idx_b1 = commits_branch_1[i..]
+            let idx_b1_ = commits_branch_1[i..]
                 .iter()
                 .position(|oid| oid.eq(&merge_base_oid));
-            let idx_b2 = commits_branch_2[j..]
+            let idx_b2_ = commits_branch_2[j..]
                 .iter()
                 .position(|oid| oid.eq(&merge_base_oid));
-            let (oids_slice, idx_to_iterate) = match (idx_b1, idx_b2) {
+            let (oids_slice, idx_to_iterate, iter_branch, base_branch) = match (idx_b1_, idx_b2_) {
                 (Some(idx_b1), None) => {
+                    i += idx_b1; // Move the index to the merge-base
                     trace!(
                         "merge-base is in branch 1: {}, oid: {}, idx: {}",
-                        branch_1, merge_base_oid, idx_b1
+                        branch_1,
+                        repo.short_id_str(merge_base_oid),
+                        idx_b1
                     );
-                    // Should be invariant but just in case
-                    assert!(idx_b1 >= i);
-                    i = idx_b1; // Move the index to the merge-base
                     // Save the slice to be iterated and the used index (from the branch that does not contain the merge-base)
-                    (&commits_branch_2[j..], &mut j)
+                    (&commits_branch_2[j..], &mut j, branch_2, branch_1)
                 }
                 (None, Some(idx_b2)) => {
+                    j += idx_b2; // Move the index to the merge-base
                     trace!(
                         "merge-base is in branch 2: {}, oid: {}, idx: {}",
-                        branch_2, merge_base_oid, idx_b2
+                        branch_2,
+                        repo.short_id_str(merge_base_oid),
+                        idx_b2
                     );
-                    // Should be invariant but just in case
-                    assert!(idx_b2 >= j);
-                    j = idx_b2; // Move the index to the merge-base
                     // Save the slice to be iterated and the used index (from the branch that does not contain the merge-base)
-                    (&commits_branch_1[i..], &mut i)
+                    (&commits_branch_1[i..], &mut i, branch_1, branch_2)
+                }
+                (None, None) => {
+                    trace!("Merge-base is outside this pair of branches");
+                    return Ok(());
                 }
                 _ => return Err(GitBrustError::MergeBaseError),
             };
 
             let mut merge_base_merge_commit_oid: Option<&Oid> = None;
+
+            let mut flag_broke_from_loop = false;
             // Iterate over the commits from the branch that do not include the merge base
             for oit_comm in oids_slice {
-                trace!("Oid from non merge-base branch: {}", oit_comm);
+                trace!(
+                    "Oid from non merge-base branch: {}",
+                    repo.short_id_str(*oit_comm)
+                );
                 // Check if the merge base is still the same
                 let new_merge_base_oid = repo.merge_base(merge_base_oid, *oit_comm)?;
                 if new_merge_base_oid != merge_base_oid {
                     trace!(
                         "New merge base found: {} -> {}",
-                        merge_base_oid, new_merge_base_oid
+                        repo.short_id_str(merge_base_oid),
+                        repo.short_id_str(new_merge_base_oid)
                     );
+
                     info!(
-                        "Merge base merge commit: {}",
-                        merge_base_merge_commit_oid.unwrap()
+                        "Found intermerge: {} -> {} : {} -> {}",
+                        base_branch,
+                        iter_branch,
+                        repo.short_id_str(merge_base_oid),
+                        repo.short_id_str(*merge_base_merge_commit_oid.unwrap())
                     );
+                    flag_broke_from_loop = true;
                     break;
                 } else {
+                    // Store the previous oid
                     merge_base_merge_commit_oid = Some(oit_comm);
                 }
                 *idx_to_iterate += 1;
+            }
+            if !flag_broke_from_loop {
+                info!(
+                    "Found feature birth {} -> {} : {} -> {}",
+                    base_branch,
+                    iter_branch,
+                    repo.short_id_str(merge_base_oid),
+                    repo.short_id_str(*merge_base_merge_commit_oid.unwrap())
+                );
             }
         }
     }
