@@ -135,123 +135,130 @@ impl RepositoryExt for Repository {
     }
 }
 
+/// Calculate relations (merges and feature births) between first-parent commit chains.
 fn calculate_fp_relations<'repo>(
     repo: &'repo Repository,
-    fp_chains: &BranchFPChain,
+    fp_chains: &BranchFPChain<'repo>,
 ) -> Result<Vec<Relation<'repo>>, GitBrustError> {
-    let mut out_relations: Vec<Relation> = vec![];
+    let mut out_relations = Vec::new();
 
-    for pair in fp_chains.iter().combinations(2) {
-        let (branch_1, commits_branch_1) = pair[0];
-        let (branch_2, commits_branch_2) = pair[1];
-
+    // Iterate over unique pairs of branches
+    for (branch_1, fp1, branch_2, fp2) in fp_chains
+        .iter()
+        .combinations(2)
+        .map(|pair| (pair[0].0, &pair[0].1.chain, pair[1].0, &pair[1].1.chain))
+    {
         trace!("Pair: {} <-> {}", branch_1, branch_2);
 
-        // Create two indexes to iterate the two fp chains
-        let mut i = 0;
-        let mut j = 0;
+        let mut slice1 = &fp1[..];
+        let mut slice2 = &fp2[..];
 
-        while i < commits_branch_1.len() && j < commits_branch_2.len() {
-            // Get the ids from that indexes
-            let oid1 = commits_branch_1[i];
-            let oid2 = commits_branch_2[j];
-
-            // Find merge base
+        while let (Some(&oid1), Some(&oid2)) = (slice1.first(), slice2.first()) {
             let merge_base_oid = repo.merge_base(oid1, oid2)?;
             trace!("  merge-base id: {}", repo.short_id_str(merge_base_oid));
 
-            // See wich branch does not contains the merge base
-            let idx_b1_ = commits_branch_1[i..]
-                .iter()
-                .position(|oid| oid.eq(&merge_base_oid));
-            let idx_b2_ = commits_branch_2[j..]
-                .iter()
-                .position(|oid| oid.eq(&merge_base_oid));
-            let (oids_slice, idx_to_iterate, iter_branch, base_branch) = match (idx_b1_, idx_b2_) {
-                (Some(idx_b1), None) => {
-                    i += idx_b1; // Move the index to the merge-base
+            // Find merge-base position in each branch slice
+            let idx_b1 = slice1.iter().position(|oid| *oid == merge_base_oid);
+            let idx_b2 = slice2.iter().position(|oid| *oid == merge_base_oid);
+
+            let (slice, next_slice, iter_branch, base_branch) = match (idx_b1, idx_b2) {
+                (Some(idx), None) => {
                     trace!(
-                        "merge-base is in branch 1: {}, oid: {}, idx: {}",
+                        "merge-base found in branch {} at idx {} ({})",
                         branch_1,
-                        repo.short_id_str(merge_base_oid),
-                        idx_b1
+                        idx,
+                        repo.short_id_str(merge_base_oid)
                     );
-                    // Save the slice to be iterated and the used index (from the branch that does not contain the merge-base)
-                    (&commits_branch_2[j..], &mut j, branch_2, branch_1)
+                    (slice2, &slice1[idx..], branch_2, branch_1)
                 }
-                (None, Some(idx_b2)) => {
-                    j += idx_b2; // Move the index to the merge-base
+                (None, Some(idx)) => {
                     trace!(
-                        "merge-base is in branch 2: {}, oid: {}, idx: {}",
+                        "merge-base found in branch {} at idx {} ({})",
                         branch_2,
-                        repo.short_id_str(merge_base_oid),
-                        idx_b2
+                        idx,
+                        repo.short_id_str(merge_base_oid)
                     );
-                    // Save the slice to be iterated and the used index (from the branch that does not contain the merge-base)
-                    (&commits_branch_1[i..], &mut i, branch_1, branch_2)
+                    (slice1, &slice2[idx..], branch_1, branch_2)
                 }
                 (None, None) => {
-                    trace!("Merge-base is outside this pair of branches");
-                    continue;
+                    trace!("Merge-base not present in either branch of this pair");
+                    break;
                 }
                 _ => return Err(GitBrustError::MergeBaseError),
             };
 
-            // Relation detection loop
-            // Scan commits to detect merge base changes and build a relation
+            if let Some((relation, advanced)) =
+                detect_relation(repo, merge_base_oid, slice, base_branch, iter_branch)
             {
-                // Split the slice into first element and the rest
-                let (first, rest) = oids_slice.split_first().expect("Slice must not be empty");
-
-                let mut previous_oid = first;
-
-                let relation = rest
-                    .iter()
-                    .enumerate()
-                    .find_map(|(i, current_oid)| {
-                        trace!(
-                            "Oid from non merge-base branch: {}",
-                            repo.short_id_str(*current_oid)
-                        );
-
-                        let new_merge_base_oid =
-                            repo.merge_base(merge_base_oid, *current_oid).ok()?;
-                        if new_merge_base_oid != merge_base_oid {
-                            let relation = Relation {
-                                src: merge_base_oid,
-                                dst: *previous_oid,
-                                repo,
-                            };
-                            debug!(
-                                "Found intermerge: {} -> {} : {}",
-                                base_branch, iter_branch, relation
-                            );
-                            Some(relation)
-                        } else {
-                            previous_oid = current_oid;
-                            *idx_to_iterate = i + 2; // +1 for enumerate, +1 because we split off the first
-                            None
-                        }
-                    })
-                    .unwrap_or_else(|| {
-                        // No merge-base change found, use the last commit
-                        let relation = Relation {
-                            src: merge_base_oid,
-                            dst: *previous_oid,
-                            repo,
-                        };
-                        debug!(
-                            "Found feature birth {} -> {} : {}",
-                            base_branch, iter_branch, relation
-                        );
-                        relation
-                    });
-
                 out_relations.push(relation);
+                // Advance the slice of the branch we iterated
+                if iter_branch == branch_1 {
+                    slice1 = &slice1[advanced..];
+                } else {
+                    slice2 = &slice2[advanced..];
+                }
+                // Keep the other slice as is
+                if iter_branch == branch_1 {
+                    slice2 = next_slice;
+                } else {
+                    slice1 = next_slice;
+                }
+            } else {
+                break;
             }
         }
     }
+
     Ok(out_relations)
+}
+
+/// Detects a relation by scanning a commit slice until a merge-base change occurs
+/// Returns a relation and the number of commits consumed
+fn detect_relation<'repo>(
+    repo: &'repo Repository,
+    merge_base_oid: Oid,
+    slice: &[Oid],
+    base_branch: &str,
+    iter_branch: &str,
+) -> Option<(Relation<'repo>, usize)> {
+    let (first, rest) = slice.split_first()?;
+    let mut previous_oid = *first;
+
+    for (i, current_oid) in rest.iter().enumerate() {
+        trace!(
+            "Oid from non merge-base branch: {}",
+            repo.short_id_str(*current_oid)
+        );
+
+        if let Ok(new_merge_base) = repo.merge_base(merge_base_oid, *current_oid) {
+            if new_merge_base != merge_base_oid {
+                let relation = Relation {
+                    src: merge_base_oid,
+                    dst: previous_oid,
+                    repo,
+                };
+                debug!(
+                    "Found intermerge: {} -> {} : {}",
+                    base_branch, iter_branch, relation
+                );
+                return Some((relation, i + 1));
+            }
+        }
+
+        previous_oid = *current_oid;
+    }
+
+    // If no merge-base change detected, relation is a feature birth
+    let relation = Relation {
+        src: merge_base_oid,
+        dst: previous_oid,
+        repo,
+    };
+    debug!(
+        "Found feature birth {} -> {} : {}",
+        base_branch, iter_branch, relation
+    );
+    Some((relation, slice.len()))
 }
 
 /// Retrieves branch names from command-line arguments, or uses default branches if in debug mode
