@@ -197,55 +197,56 @@ fn calculate_fp_relations<'repo>(
                 _ => return Err(GitBrustError::MergeBaseError),
             };
 
-            let mut merge_base_merge_commit_oid: Option<&Oid> = None;
+            // Relation detection loop
+            // Scan commits to detect merge base changes and build a relation
+            {
+                // Split the slice into first element and the rest
+                let (first, rest) = oids_slice.split_first().expect("Slice must not be empty");
 
-            let mut flag_broke_from_loop = false;
-            // Iterate over the commits from the branch that do not include the merge base
-            for oit_comm in oids_slice {
-                trace!(
-                    "Oid from non merge-base branch: {}",
-                    repo.short_id_str(*oit_comm)
-                );
-                // Check if the merge base is still the same
-                let new_merge_base_oid = repo.merge_base(merge_base_oid, *oit_comm)?;
-                if new_merge_base_oid != merge_base_oid {
-                    trace!(
-                        "New merge base found: {} -> {}",
-                        repo.short_id_str(merge_base_oid),
-                        repo.short_id_str(new_merge_base_oid)
-                    );
+                let mut previous_oid = first;
 
-                    let relation = Relation {
-                        src: merge_base_oid,
-                        dst: *merge_base_merge_commit_oid.unwrap(),
-                        repo,
-                    };
+                let relation = rest
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, current_oid)| {
+                        trace!(
+                            "Oid from non merge-base branch: {}",
+                            repo.short_id_str(*current_oid)
+                        );
 
-                    debug!(
-                        "Found intermerge: {} -> {} : {}",
-                        base_branch, iter_branch, relation
-                    );
+                        let new_merge_base_oid =
+                            repo.merge_base(merge_base_oid, *current_oid).ok()?;
+                        if new_merge_base_oid != merge_base_oid {
+                            let relation = Relation {
+                                src: merge_base_oid,
+                                dst: *previous_oid,
+                                repo,
+                            };
+                            debug!(
+                                "Found intermerge: {} -> {} : {}",
+                                base_branch, iter_branch, relation
+                            );
+                            Some(relation)
+                        } else {
+                            previous_oid = current_oid;
+                            *idx_to_iterate = i + 2; // +1 for enumerate, +1 because we split off the first
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| {
+                        // No merge-base change found, use the last commit
+                        let relation = Relation {
+                            src: merge_base_oid,
+                            dst: *previous_oid,
+                            repo,
+                        };
+                        debug!(
+                            "Found feature birth {} -> {} : {}",
+                            base_branch, iter_branch, relation
+                        );
+                        relation
+                    });
 
-                    out_relations.push(relation);
-
-                    flag_broke_from_loop = true;
-                    break;
-                } else {
-                    // Store the previous oid
-                    merge_base_merge_commit_oid = Some(oit_comm);
-                }
-                *idx_to_iterate += 1;
-            }
-            if !flag_broke_from_loop {
-                let relation = Relation {
-                    src: merge_base_oid,
-                    dst: *merge_base_merge_commit_oid.unwrap(),
-                    repo,
-                };
-                debug!(
-                    "Found feature birth {} -> {} : {}",
-                    base_branch, iter_branch, relation
-                );
                 out_relations.push(relation);
             }
         }
