@@ -20,8 +20,9 @@ use env_logger::Builder;
 use git2::{Commit, Oid, Repository};
 use indexmap::IndexMap;
 use itertools::Itertools;
-use log::{error, info, trace};
-use std::{collections::HashSet, vec};
+use log::{debug, error, info, trace};
+use std::ops::{Deref, DerefMut};
+use std::{collections::HashSet, fmt, vec};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -36,13 +37,62 @@ enum GitBrustError {
     MergeBaseError,
 }
 
+/// If true, uses example branches when no input branches are provided
 const DEBUG_BRANCHES: bool = true;
 
-type BranchFPChain = IndexMap<String, Vec<Oid>>;
+/// First-parent commit chain from a branch
+struct FPChain<'repo> {
+    chain: Vec<Oid>,
+    repo: &'repo Repository, // Used only for printing short commit IDs
+}
+type BranchFPChain<'repo> = IndexMap<String, FPChain<'repo>>;
+
+impl<'repo> fmt::Display for FPChain<'repo> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let chain_str = self
+            .chain
+            .iter()
+            .map(|oid| self.repo.short_id_str(*oid))
+            .join(", ");
+        write!(f, "{}", chain_str)
+    }
+}
+
+// Allow treating FPChain as a Vec<Oid> (immutable)
+impl<'repo> Deref for FPChain<'repo> {
+    type Target = Vec<Oid>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.chain
+    }
+}
+
+// Allow treating FPChain as a Vec<Oid> (mutable)
+impl<'repo> DerefMut for FPChain<'repo> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.chain
+    }
+}
+
+/// Relation between commits from two first-parent chains
+struct Relation<'repo> {
+    src: Oid,
+    dst: Oid,
+    repo: &'repo Repository, // Used only for printing short commit IDs
+}
+
+// Displays a Relation using the short IDs of the source and destination commits
+impl<'repo> fmt::Display for Relation<'repo> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let short_id_base = self.repo.short_id_str(self.src);
+        let short_id_merge = self.repo.short_id_str(self.dst);
+        write!(f, "{} -> {}", short_id_base, short_id_merge)
+    }
+}
 
 fn main() -> Result<(), GitBrustError> {
     // Initialize the logger
-    Builder::new().filter_level(log::LevelFilter::Info).init();
+    Builder::new().filter_level(log::LevelFilter::Trace).init();
 
     // Open git repository
     let repo = Repository::open(".")?;
@@ -51,10 +101,16 @@ fn main() -> Result<(), GitBrustError> {
     let branches = get_branches_from_args()?;
     info!("Branches to use: {}", branches.join(", "));
 
+    // Gets the first-parent commit chains for each branch, skipping commits already included in previous branches
     let branch_fp_commit_chains = get_unique_fp_commits_chain(&repo, branches)?;
-    print_branch_commits(&repo, &branch_fp_commit_chains)?;
+    print_branch_commits(&branch_fp_commit_chains)?;
 
-    calculate_fp_relations(&repo, &branch_fp_commit_chains)?;
+    // Obtains all Relations between commits from the first-parent chains
+    let relations = calculate_fp_relations(&repo, &branch_fp_commit_chains)?;
+    info!("Relations:");
+    for relation in relations {
+        info!("{}", relation);
+    }
 
     Ok(())
 }
@@ -64,6 +120,7 @@ pub trait RepositoryExt {
     fn short_id_str(&self, oid: Oid) -> String;
 }
 
+// Repository helper to get an object's short ID
 impl RepositoryExt for Repository {
     fn short_id_str(&self, oid: Oid) -> String {
         let obj = match self.find_object(oid, None) {
@@ -78,10 +135,12 @@ impl RepositoryExt for Repository {
     }
 }
 
-fn calculate_fp_relations(
-    repo: &Repository,
+fn calculate_fp_relations<'repo>(
+    repo: &'repo Repository,
     fp_chains: &BranchFPChain,
-) -> Result<(), GitBrustError> {
+) -> Result<Vec<Relation<'repo>>, GitBrustError> {
+    let mut out_relations: Vec<Relation> = vec![];
+
     for pair in fp_chains.iter().combinations(2) {
         let (branch_1, commits_branch_1) = pair[0];
         let (branch_2, commits_branch_2) = pair[1];
@@ -99,7 +158,7 @@ fn calculate_fp_relations(
 
             // Find merge base
             let merge_base_oid = repo.merge_base(oid1, oid2)?;
-            trace!("  merge-base id: {:?}", repo.short_id_str(merge_base_oid));
+            trace!("  merge-base id: {}", repo.short_id_str(merge_base_oid));
 
             // See wich branch does not contains the merge base
             let idx_b1_ = commits_branch_1[i..]
@@ -133,7 +192,7 @@ fn calculate_fp_relations(
                 }
                 (None, None) => {
                     trace!("Merge-base is outside this pair of branches");
-                    return Ok(());
+                    continue;
                 }
                 _ => return Err(GitBrustError::MergeBaseError),
             };
@@ -156,13 +215,19 @@ fn calculate_fp_relations(
                         repo.short_id_str(new_merge_base_oid)
                     );
 
-                    info!(
-                        "Found intermerge: {} -> {} : {} -> {}",
-                        base_branch,
-                        iter_branch,
-                        repo.short_id_str(merge_base_oid),
-                        repo.short_id_str(*merge_base_merge_commit_oid.unwrap())
+                    let relation = Relation {
+                        src: merge_base_oid,
+                        dst: *merge_base_merge_commit_oid.unwrap(),
+                        repo,
+                    };
+
+                    debug!(
+                        "Found intermerge: {} -> {} : {}",
+                        base_branch, iter_branch, relation
                     );
+
+                    out_relations.push(relation);
+
                     flag_broke_from_loop = true;
                     break;
                 } else {
@@ -172,19 +237,23 @@ fn calculate_fp_relations(
                 *idx_to_iterate += 1;
             }
             if !flag_broke_from_loop {
-                info!(
-                    "Found feature birth {} -> {} : {} -> {}",
-                    base_branch,
-                    iter_branch,
-                    repo.short_id_str(merge_base_oid),
-                    repo.short_id_str(*merge_base_merge_commit_oid.unwrap())
+                let relation = Relation {
+                    src: merge_base_oid,
+                    dst: *merge_base_merge_commit_oid.unwrap(),
+                    repo,
+                };
+                debug!(
+                    "Found feature birth {} -> {} : {}",
+                    base_branch, iter_branch, relation
                 );
+                out_relations.push(relation);
             }
         }
     }
-    Ok(())
+    Ok(out_relations)
 }
 
+/// Retrieves branch names from command-line arguments, or uses default branches if in debug mode
 fn get_branches_from_args() -> Result<Vec<String>, GitBrustError> {
     let args: Vec<String> = std::env::args().skip(1).collect(); // Skip the executable name
 
@@ -202,6 +271,7 @@ fn get_branches_from_args() -> Result<Vec<String>, GitBrustError> {
     }
 }
 
+/// Resolves a branch name to its latest commit in the repository
 fn resolve_branch_to_commit<'repo>(
     repo: &'repo Repository,
     branch_name: &str,
@@ -210,29 +280,33 @@ fn resolve_branch_to_commit<'repo>(
     Ok(current_commit)
 }
 
-fn get_unique_fp_commits_chain(
-    repo: &Repository,
+/// Gets the first-parent commit chains for each branch, skipping commits already included in previous branches
+fn get_unique_fp_commits_chain<'repo>(
+    repo: &'repo Repository,
     branches_names: Vec<String>,
-) -> Result<BranchFPChain, git2::Error> {
-    // Map each branch name to its first-parent commit chain.
-    let mut first_parent_chains: IndexMap<String, Vec<Oid>> = IndexMap::new();
-    // Track commit IDs to ensure each commit is processed only once across branches.
+) -> Result<BranchFPChain<'repo>, git2::Error> {
+    // Map each branch name to its first-parent commit chain
+    let mut first_parent_chains: BranchFPChain = IndexMap::new();
+    // Track commit IDs to ensure each commit is processed only once across branches
     let mut seen_ids: HashSet<Oid> = HashSet::new();
 
-    // Process each branch by resolving its commit chain following first parents.
+    // Process each branch by resolving its commit chain following first parents
     for branch in branches_names {
-        let mut chain: Vec<Oid> = Vec::new();
+        let mut chain: FPChain = FPChain {
+            chain: vec![],
+            repo,
+        };
         let mut current = resolve_branch_to_commit(repo, &branch)?;
 
-        // Traverse the first-parent chain until reaching an already seen commit or there is no parent commit.
+        // Traverse the first-parent chain until reaching an already seen commit or there is no parent commit
         while seen_ids.insert(current.id()) {
             let parent = current.parent(0);
-            // Add the current commit to the result chain.
+            // Add the current commit to the result chain
             chain.push(current.id());
-            // Update current to its first parent, if available.
+            // Update current to its first parent, if available
             current = match parent {
                 Ok(parent) => parent,
-                Err(_) => break, // Stop if no first parent is available.
+                Err(_) => break, // Stop if no first parent is available
             };
         }
         // Add the chain to the map.
@@ -241,23 +315,10 @@ fn get_unique_fp_commits_chain(
     Ok(first_parent_chains)
 }
 
-/// Print branch names and their commits (short IDs).
-fn print_branch_commits<'repo>(
-    repo: &Repository,
-    branches: &BranchFPChain,
-) -> Result<(), git2::Error> {
+/// Print branch names and their commits (short IDs)
+fn print_branch_commits(branches: &BranchFPChain) -> Result<(), GitBrustError> {
     for (branch, ids) in branches {
-        println!("Branch: {}", branch);
-        for id in ids {
-            println!(
-                "  {}",
-                repo.find_commit(*id)?
-                    .as_object()
-                    .short_id()?
-                    .as_str()
-                    .unwrap_or("?")
-            );
-        }
+        debug!("Branch {} -> {}", branch, ids);
     }
     Ok(())
 }
