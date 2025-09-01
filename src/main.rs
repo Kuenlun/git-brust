@@ -16,12 +16,11 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
-use clap::Parser;
-use git2::{Branch, Repository};
-use log::{info, trace};
-use std::vec;
+use git2::Repository;
+use log::info;
 
 mod git;
+mod input;
 mod logic;
 mod models;
 mod ui;
@@ -31,14 +30,6 @@ mod test_utils;
 
 use crate::models::GitBrustError;
 
-/// Visualize git branch flows
-#[derive(Parser)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    /// Branches to compare
-    branches: Vec<String>,
-}
-
 fn main() -> Result<(), GitBrustError> {
     models::init_logger();
 
@@ -46,7 +37,7 @@ fn main() -> Result<(), GitBrustError> {
     let repo = Repository::open(".")?;
 
     // Parse branch names from the program arguments
-    let branches = get_branches_from_args(&repo)?;
+    let branches = input::get_branches_from_args(&repo)?;
     info!(
         "Branches to use: {}",
         git::names_from_branches(&branches)?.join(", ")
@@ -59,21 +50,4 @@ fn main() -> Result<(), GitBrustError> {
     ui::render(relations);
 
     Ok(())
-}
-
-/// Retrieves branch names from command-line arguments, or uses default branches if in debug mode
-fn get_branches_from_args<'repo>(
-    repo: &'repo Repository,
-) -> Result<Vec<Branch<'repo>>, GitBrustError> {
-    let args = Args::parse();
-
-    if args.branches.is_empty() {
-        match git::get_branch_with_more_merges(repo)? {
-            Some(branch) => Ok(vec![branch]),
-            None => Ok(vec![]),
-        }
-    } else {
-        trace!("Branches from args: {:?}", args.branches);
-        Ok(git::branches_from_names(&repo, &args.branches)?)
-    }
 }
