@@ -16,11 +16,14 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+use clap::Parser;
 use git2::Repository;
-use log::info;
 
+use crate::cli::Args;
+use crate::models::GitBrustError;
+
+mod cli;
 mod git;
-mod input;
 mod logic;
 mod models;
 mod ui;
@@ -28,20 +31,18 @@ mod ui;
 #[cfg(test)]
 mod test_utils;
 
-use crate::models::GitBrustError;
-
 fn main() -> Result<(), GitBrustError> {
+    // Initialize logging first
     models::init_logger();
 
-    // Open git repository
-    let repo = Repository::open(".")?;
+    // Parse arguments
+    let args = Args::parse();
 
-    // Parse branch names from the program arguments
-    let branches = input::get_branches_from_args(&repo)?;
-    info!(
-        "Branches to use: {}",
-        git::names_from_branches(&branches)?.join(", ")
-    );
+    // Discover repository starting from specified path or current directory
+    let repo = Repository::discover(args.get_repo_path())?;
+
+    // Resolve branch names to Branch objects
+    let branches = args.get_branches_to_use(&repo)?;
 
     // Calculate the first-parent chain per branch and their relations
     let relations = logic::analyze_branch_relations(&repo, &branches)?;
