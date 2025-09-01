@@ -16,14 +16,17 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
-use env_logger::Builder;
-use git2::Repository;
+use git2::{Branch, Repository};
 use log::{info, trace};
 use std::vec;
 
+mod git;
 mod logic;
 mod models;
 mod ui;
+
+#[cfg(test)]
+mod test_utils;
 
 use crate::models::GitBrustError;
 
@@ -31,18 +34,20 @@ use crate::models::GitBrustError;
 const DEBUG_BRANCHES: bool = true;
 
 fn main() -> Result<(), GitBrustError> {
-    // Initialize the logger
-    Builder::new().filter_level(log::LevelFilter::Trace).init();
+    models::init_logger();
 
     // Open git repository
     let repo = Repository::open(".")?;
 
     // Parse branch names from the program arguments
-    let branches = get_branches_from_args()?;
-    info!("Branches to use: {}", branches.join(", "));
+    let branches = get_branches_from_args(&repo)?;
+    info!(
+        "Branches to use: {}",
+        git::names_from_branches(&branches)?.join(", ")
+    );
 
     // Calculate the first-parent chain per branch and their relations
-    let relations = logic::analyze_branch_relations(&repo, branches)?;
+    let relations = logic::analyze_branch_relations(&repo, &branches)?;
 
     // Render UI
     ui::render(relations);
@@ -51,19 +56,21 @@ fn main() -> Result<(), GitBrustError> {
 }
 
 /// Retrieves branch names from command-line arguments, or uses default branches if in debug mode
-fn get_branches_from_args() -> Result<Vec<String>, GitBrustError> {
-    let args: Vec<String> = std::env::args().skip(1).collect(); // Skip the executable name
+fn get_branches_from_args<'repo>(
+    repo: &'repo Repository,
+) -> Result<Vec<Branch<'repo>>, GitBrustError> {
+    let branches: Vec<String> = std::env::args().skip(1).collect(); // Skip the executable name
 
-    if args.is_empty() {
+    if branches.is_empty() {
         if DEBUG_BRANCHES {
-            let branches = vec!["master".to_string(), "develop".to_string()];
+            let branches = vec!["master", "develop"];
             trace!("No input branches, using default: {}", branches.join(", "));
-            Ok(branches)
+            Ok(git::branches_from_names(&repo, &branches)?)
         } else {
             Err(GitBrustError::MissingInputBranches)
         }
     } else {
-        trace!("Branches from args: {:?}", args);
-        Ok(args)
+        trace!("Branches from args: {:?}", branches);
+        Ok(git::branches_from_names(&repo, &branches)?)
     }
 }

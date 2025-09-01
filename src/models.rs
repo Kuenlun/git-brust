@@ -16,13 +16,15 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
-use git2::Oid;
-use git2::Repository;
-use indexmap::IndexMap;
-use itertools::Itertools;
+use env_logger::Builder;
+use git2::{Branch, Commit, Oid, Repository};
+use log::LevelFilter;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
+use std::sync::Once;
 use thiserror::Error;
+
+use crate::git;
 
 #[derive(Debug, Error)]
 pub enum GitBrustError {
@@ -34,6 +36,19 @@ pub enum GitBrustError {
 
     #[error("merge-base not found in first-parent commit chain of current branches")]
     MergeBaseError,
+
+    #[error("branch not found: {0}")]
+    BranchNotFound(String),
+
+    #[error("branch does not have a valid name")]
+    BranchNameInvalid,
+}
+
+static INIT: Once = Once::new();
+pub fn init_logger() {
+    INIT.call_once(|| {
+        Builder::new().filter_level(LevelFilter::Trace).init();
+    });
 }
 
 pub enum RelationType {
@@ -51,25 +66,29 @@ pub struct Relation<'repo> {
 
 /// First-parent commit chain from a branch
 pub struct FPChain<'repo> {
-    pub chain: Vec<Oid>,
-    pub repo: &'repo Repository, // Used only for printing short commit IDs
+    pub branch: &'repo Branch<'repo>,
+    pub chain: Vec<Commit<'repo>>,
 }
-pub type BranchFPChain<'repo> = IndexMap<String, FPChain<'repo>>;
 
 impl<'repo> fmt::Display for FPChain<'repo> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let chain_str = self
+        let chain_str: Result<Vec<_>, _> = self
             .chain
             .iter()
-            .map(|oid| self.repo.short_id_str(*oid))
-            .join(", ");
-        write!(f, "{}", chain_str)
+            .map(|commit| git::commit_short_id(commit))
+            .collect();
+        let branch_str = git::name_from_branch(self.branch).map_err(|_| fmt::Error)?;
+
+        match chain_str {
+            Ok(ids) => write!(f, "{}: {}", branch_str, ids.join(", ")),
+            Err(_) => Err(fmt::Error),
+        }
     }
 }
 
 // Allow treating FPChain as a Vec<Oid> (immutable)
 impl<'repo> Deref for FPChain<'repo> {
-    type Target = Vec<Oid>;
+    type Target = Vec<Commit<'repo>>;
 
     fn deref(&self) -> &Self::Target {
         &self.chain
