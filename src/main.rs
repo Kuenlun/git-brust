@@ -16,6 +16,7 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+use clap::Parser;
 use git2::{Branch, Repository};
 use log::{info, trace};
 use std::vec;
@@ -30,8 +31,13 @@ mod test_utils;
 
 use crate::models::GitBrustError;
 
-/// If true, uses example branches when no input branches are provided
-const DEBUG_BRANCHES: bool = true;
+/// Visualize git branch flows
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Branches to compare
+    branches: Vec<String>,
+}
 
 fn main() -> Result<(), GitBrustError> {
     models::init_logger();
@@ -59,18 +65,15 @@ fn main() -> Result<(), GitBrustError> {
 fn get_branches_from_args<'repo>(
     repo: &'repo Repository,
 ) -> Result<Vec<Branch<'repo>>, GitBrustError> {
-    let branches: Vec<String> = std::env::args().skip(1).collect(); // Skip the executable name
+    let args = Args::parse();
 
-    if branches.is_empty() {
-        if DEBUG_BRANCHES {
-            let branches = vec!["master", "develop"];
-            trace!("No input branches, using default: {}", branches.join(", "));
-            Ok(git::branches_from_names(&repo, &branches)?)
-        } else {
-            Err(GitBrustError::MissingInputBranches)
+    if args.branches.is_empty() {
+        match git::get_branch_with_more_merges(repo)? {
+            Some(branch) => Ok(vec![branch]),
+            None => Ok(vec![]),
         }
     } else {
-        trace!("Branches from args: {:?}", branches);
-        Ok(git::branches_from_names(&repo, &branches)?)
+        trace!("Branches from args: {:?}", args.branches);
+        Ok(git::branches_from_names(&repo, &args.branches)?)
     }
 }

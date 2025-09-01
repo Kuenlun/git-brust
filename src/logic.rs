@@ -224,7 +224,7 @@ mod test {
     fn test_empty_repo() -> Result<(), GitBrustError> {
         models::init_logger();
         // Create a empty git repository
-        let (_tmp, repo) = test_utils::init_repo_in_tempdir();
+        let (repo, _tmp) = test_utils::init_empty_repo_in_tempdir();
         // Get local branches from the repo
         let branches = test_utils::get_local_repo_branches(&repo)?;
         assert!(branches.is_empty());
@@ -240,8 +240,8 @@ mod test {
     fn test_repo_only_one_commit() -> Result<(), GitBrustError> {
         models::init_logger();
         // Create a basic git repository
-        let (_tmp, repo) = test_utils::init_repo_in_tempdir();
-        test_utils::add_commit_to_repo(&repo)?;
+        let (repo, _tmp) = test_utils::init_repo_in_tempdir();
+
         // Get local branches from the repo
         let branches = test_utils::get_local_repo_branches(&repo)?;
         assert!(!branches.is_empty());

@@ -31,9 +31,6 @@ pub enum GitBrustError {
     #[error("git error: {0}")]
     Git(#[from] git2::Error),
 
-    #[error("no branches provided. Usage: git-brust <base> <compare>")]
-    MissingInputBranches,
-
     #[error("merge-base not found in first-parent commit chain of current branches")]
     MergeBaseError,
 
