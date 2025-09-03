@@ -27,15 +27,15 @@ use crate::models::{FPChain, GitBrustError, Relation, RelationType, RepositoryEx
 #[cfg(test)]
 use crate::test_utils;
 
-pub fn analyze_branch_relations<'repo>(
+pub fn run_logic<'repo>(
     repo: &'repo Repository,
-    branches: &'repo [Branch],
+    branches: &'repo [Branch<'repo>],
 ) -> Result<Vec<Relation<'repo>>, GitBrustError> {
     // Gets the first-parent commit chains for each branch, skipping commits already included in previous branches
     let branch_fp_commit_chains = unique_fp_chains(branches)?;
 
     // Obtains all Relations between commits from the first-parent chains
-    let relations = calculate_fp_relations(&repo, &branch_fp_commit_chains)?;
+    let relations = build_relations(repo, &branch_fp_commit_chains)?;
     Ok(relations)
 }
 
@@ -79,137 +79,140 @@ pub fn unique_fp_chains<'repo>(
     Ok(fp_chains)
 }
 
-/// Calculate relations (merges and feature births) between first-parent commit chains.
-fn calculate_fp_relations<'repo>(
+fn build_relations<'repo>(
     repo: &'repo Repository,
-    fp_chains: &Vec<FPChain<'repo>>,
+    fp_chains: &'repo [FPChain<'repo>],
 ) -> Result<Vec<Relation<'repo>>, GitBrustError> {
+    let mut relations: Vec<Relation<'repo>> = Vec::new();
+    for (fp_chain1, fp_chain2) in fp_chains.iter().tuple_combinations() {
+        // TODO: Study if better not to extend and save the results of each pair
+        relations.extend(build_relations_from_pair(repo, fp_chain1, fp_chain2)?);
+    }
+    Ok(relations)
+}
+
+fn build_relations_from_pair<'repo>(
+    repo: &'repo Repository,
+    fp_chain_a: &'repo FPChain<'repo>,
+    fp_chain_b: &'repo FPChain<'repo>,
+) -> Result<Vec<Relation<'repo>>, GitBrustError> {
+    let branch_a_name = git::name_from_branch(fp_chain_a.branch)?;
+    let branch_b_name = git::name_from_branch(fp_chain_b.branch)?;
+    trace!(
+        "Analyzing chains for branches: {} <-> {}",
+        branch_a_name, branch_b_name
+    );
+    let mut chain_a = fp_chain_a.iter().peekable();
+    let mut chain_b = fp_chain_b.iter().peekable();
+
     let mut out_relations = Vec::new();
 
-    // Iterate over unique pairs of branches
-    for (fp1, fp2) in fp_chains
-        .iter()
-        .combinations(2)
-        .map(|pair| (pair[0], pair[1]))
-    {
+    loop {
+        // Take only Oids so the mutable borrow from peek does not escape this statement
+        let (commit_a_id, commit_b_id) = match (chain_a.peek(), chain_b.peek()) {
+            (Some(a), Some(b)) => (a.id(), b.id()),
+            _ => break,
+        };
         trace!(
-            "Pair: {} <-> {}",
-            git::name_from_branch(fp1.branch)?,
-            git::name_from_branch(fp2.branch)?
+            "  commit_a: {}, commit_b: {}",
+            repo.short_id_str(commit_a_id),
+            repo.short_id_str(commit_b_id)
         );
 
-        let mut slice1 = &fp1[..];
-        let mut slice2 = &fp2[..];
+        // Find merge-base between the two commits
+        let merge_base_oid = repo.merge_base(commit_a_id, commit_b_id)?;
+        trace!("  merge-base: {}", repo.short_id_str(merge_base_oid));
 
-        while let (Some(commit_fp1), Some(commit_fp2)) = (slice1.first(), slice2.first()) {
-            let merge_base_oid = repo.merge_base(commit_fp1.id(), commit_fp2.id())?;
-            trace!("  merge-base id: {}", repo.short_id_str(merge_base_oid));
+        // Find in which chain the merge-base is located
+        let in_chain_a = fp_chain_a.iter().any(|c| c.id() == merge_base_oid);
+        let in_chain_b = fp_chain_b.iter().any(|c| c.id() == merge_base_oid);
 
-            // Find merge-base position in each branch slice
-            let idx_b1 = slice1
-                .iter()
-                .position(|commit| commit.id() == merge_base_oid);
-            let idx_b2 = slice2
-                .iter()
-                .position(|commit| commit.id() == merge_base_oid);
-
-            let (slice, next_slice, iter_branch, base_branch) = match (idx_b1, idx_b2) {
-                (Some(idx), None) => {
-                    trace!(
-                        "merge-base found in branch {} at idx {} ({})",
-                        git::name_from_branch(fp1.branch)?,
-                        idx,
-                        repo.short_id_str(merge_base_oid)
-                    );
-                    (slice2, &slice1[idx..], fp2, fp1)
-                }
-                (None, Some(idx)) => {
-                    trace!(
-                        "merge-base found in branch {} at idx {} ({})",
-                        git::name_from_branch(fp2.branch)?,
-                        idx,
-                        repo.short_id_str(merge_base_oid)
-                    );
-                    (slice1, &slice2[idx..], fp1, fp2)
-                }
-                (None, None) => {
-                    trace!("Merge-base not present in either branch of this pair");
-                    break;
-                }
-                _ => return Err(GitBrustError::MergeBaseError),
-            };
-
-            if let Some((relation, advanced)) =
-                detect_relation(repo, merge_base_oid, slice, base_branch, iter_branch)
-            {
-                out_relations.push(relation);
-                // Advance the slice of the branch we iterated
-                if git::name_from_branch(iter_branch.branch)? == git::name_from_branch(fp1.branch)?
-                {
-                    slice1 = &slice1[advanced..];
-                } else {
-                    slice2 = &slice2[advanced..];
-                }
-                // Keep the other slice as is
-                if git::name_from_branch(iter_branch.branch)? == git::name_from_branch(fp1.branch)?
-                {
-                    slice2 = next_slice;
-                } else {
-                    slice1 = next_slice;
-                }
-            } else {
+        // Decide roles and build an owned Commit for the "no-merge-base" side
+        let relation = match (in_chain_a, in_chain_b) {
+            (true, false) => {
+                // merge-base is in A, so current on B
+                detect_relation(
+                    repo,
+                    &mut chain_a,
+                    &mut chain_b,
+                    merge_base_oid,
+                    commit_b_id,
+                )?
+            }
+            (false, true) => {
+                // merge-base is in B, so current on A
+                detect_relation(
+                    repo,
+                    &mut chain_b,
+                    &mut chain_a,
+                    merge_base_oid,
+                    commit_a_id,
+                )?
+            }
+            (false, false) => {
+                trace!("Merge-base not found in either chain");
                 break;
             }
-        }
+            (true, true) => {
+                return Err(GitBrustError::RelationPair(
+                    "Merge-base is in both chains".into(),
+                ));
+            }
+        };
+
+        // Add relation to output
+        out_relations.push(relation);
     }
 
     Ok(out_relations)
 }
 
-/// Detects a relation by scanning a commit slice until a merge-base change occurs
-/// Returns a relation and the number of commits consumed
 fn detect_relation<'repo>(
     repo: &'repo Repository,
+    chain_merge_base: &mut std::iter::Peekable<std::slice::Iter<'repo, Commit<'repo>>>,
+    chain_no_merge_base: &mut std::iter::Peekable<std::slice::Iter<'repo, Commit<'repo>>>,
     merge_base_oid: Oid,
-    slice: &[Commit],
-    base_branch: &FPChain,
-    iter_branch: &FPChain,
-) -> Option<(Relation<'repo>, usize)> {
-    let (first, rest) = slice.split_first()?;
-    let mut previous_commit = first;
-
-    for (i, current_commit) in rest.iter().enumerate() {
-        if let Ok(new_merge_base) = repo.merge_base(merge_base_oid, current_commit.id()) {
-            if new_merge_base != merge_base_oid {
-                let relation = Relation {
-                    src: merge_base_oid,
-                    dst: previous_commit.id(),
-                    rel_type: RelationType::Merge,
-                    repo,
-                };
-                debug!(
-                    "Found intermerge: {} -> {} : {}",
-                    base_branch, iter_branch, relation
-                );
-                return Some((relation, i + 1));
-            }
+    current_commit_no_merge_base: Oid,
+) -> Result<Relation<'repo>, GitBrustError> {
+    // Advance the iterator of the merge-base chain up to the merge-base
+    while let Some(commit) = chain_merge_base.peek() {
+        if commit.id() == merge_base_oid {
+            break;
         }
-
-        previous_commit = &current_commit;
+        chain_merge_base.next();
     }
-
-    // If no merge-base change detected, relation is a feature birth
-    let relation = Relation {
+    // Fix the iterator of the merge-base chain and iterate the other chain
+    // calculating the merge-base until it changes
+    let last_commit_before_change = current_commit_no_merge_base;
+    while let Some(commit) = chain_no_merge_base.peek() {
+        let new_merge_base_oid = repo.merge_base(merge_base_oid, commit.id())?;
+        if new_merge_base_oid != merge_base_oid {
+            // Merge-base changed, we found a relation
+            trace!(
+                "Merge-base changed: {} -> {}",
+                repo.short_id_str(merge_base_oid),
+                repo.short_id_str(new_merge_base_oid),
+            );
+            trace!(
+                "  last_commit_before_change: {}",
+                repo.short_id_str(last_commit_before_change)
+            );
+            return Ok(Relation {
+                src: merge_base_oid,
+                dst: last_commit_before_change,
+                rel_type: RelationType::Merge,
+                repo,
+            });
+        }
+        chain_no_merge_base.next();
+    }
+    // If we exit the loop without detecting a merge-base change, it's a branch birth
+    Ok(Relation {
         src: merge_base_oid,
-        dst: previous_commit.id(),
+        dst: last_commit_before_change,
         rel_type: RelationType::Birth,
         repo,
-    };
-    debug!(
-        "Found feature birth {} -> {} : {}",
-        base_branch, iter_branch, relation
-    );
-    Some((relation, slice.len()))
+    })
 }
 
 #[cfg(test)]
@@ -227,7 +230,7 @@ mod test {
         assert!(branches.is_empty());
 
         // Check it works even if the repo is empty
-        let relations = analyze_branch_relations(&repo, &branches)?;
+        let relations = run_logic(&repo, &branches)?;
         assert!(relations.is_empty());
 
         Ok(())
@@ -243,7 +246,7 @@ mod test {
         let branches = test_utils::get_local_repo_branches(&repo)?;
         assert!(!branches.is_empty());
 
-        let relations = analyze_branch_relations(&repo, &branches)?;
+        let relations = run_logic(&repo, &branches)?;
 
         // Check it works even if the repo is empty
         assert!(relations.is_empty());

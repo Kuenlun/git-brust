@@ -31,8 +31,8 @@ pub enum GitBrustError {
     #[error("git error: {0}")]
     Git(#[from] git2::Error),
 
-    #[error("merge-base not found in first-parent commit chain of current branches")]
-    MergeBaseError,
+    #[error("relation pair error: {0}")]
+    RelationPair(String),
 
     #[error("branch not found: {0}")]
     BranchNotFound(String),

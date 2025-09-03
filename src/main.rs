@@ -45,7 +45,7 @@ fn main() -> Result<(), GitBrustError> {
     let branches = args.get_branches_to_use(&repo)?;
 
     // Calculate the first-parent chain per branch and their relations
-    let relations = logic::analyze_branch_relations(&repo, &branches)?;
+    let relations = logic::run_logic(&repo, &branches)?;
 
     // Render UI
     ui::render(relations);
