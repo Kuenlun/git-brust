@@ -54,11 +54,10 @@ pub enum RelationType {
 }
 
 /// Relation between commits from two first-parent chains
-pub struct Relation<'repo> {
+pub struct Relation {
     pub src: Oid,
     pub dst: Oid,
     pub rel_type: RelationType,
-    pub repo: &'repo Repository, // Used only for printing short commit IDs
 }
 
 /// First-parent commit chain from a branch
@@ -96,20 +95,6 @@ impl<'repo> Deref for FPChain<'repo> {
 impl<'repo> DerefMut for FPChain<'repo> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.chain
-    }
-}
-
-// Displays a Relation using the short IDs of the source and destination commits
-impl<'repo> fmt::Display for Relation<'repo> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let short_id_base = self.repo.short_id_str(self.src);
-        let short_id_merge = self.repo.short_id_str(self.dst);
-
-        match self.rel_type {
-            RelationType::Merge => write!(f, "Merge: ")?,
-            RelationType::Birth => write!(f, "Birth: ")?,
-        }
-        write!(f, "{} -> {}", short_id_base, short_id_merge)
     }
 }
 

@@ -23,6 +23,14 @@ use crate::models::Relation;
 pub fn render(relations: Vec<Relation>) -> () {
     info!("Relations:");
     for relation in &relations {
-        info!("{}", relation);
+        info!(
+            "{}, {}, {}",
+            relation.src,
+            relation.dst,
+            match relation.rel_type {
+                crate::models::RelationType::Birth => "Birth",
+                crate::models::RelationType::Merge => "Merge",
+            }
+        );
     }
 }

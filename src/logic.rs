@@ -30,7 +30,7 @@ use crate::test_utils;
 pub fn run_logic<'repo>(
     repo: &'repo Repository,
     branches: &'repo [Branch<'repo>],
-) -> Result<Vec<Relation<'repo>>, GitBrustError> {
+) -> Result<Vec<Relation>, GitBrustError> {
     // Gets the first-parent commit chains for each branch, skipping commits already included in previous branches
     let branch_fp_commit_chains = unique_fp_chains(branches)?;
 
@@ -82,8 +82,8 @@ pub fn unique_fp_chains<'repo>(
 fn build_relations<'repo>(
     repo: &'repo Repository,
     fp_chains: &'repo [FPChain<'repo>],
-) -> Result<Vec<Relation<'repo>>, GitBrustError> {
-    let mut relations: Vec<Relation<'repo>> = Vec::new();
+) -> Result<Vec<Relation>, GitBrustError> {
+    let mut relations: Vec<Relation> = Vec::new();
     for (fp_chain1, fp_chain2) in fp_chains.iter().tuple_combinations() {
         // TODO: Study if better not to extend and save the results of each pair
         relations.extend(build_relations_from_pair(repo, fp_chain1, fp_chain2)?);
@@ -95,7 +95,7 @@ fn build_relations_from_pair<'repo>(
     repo: &'repo Repository,
     fp_chain_a: &'repo FPChain<'repo>,
     fp_chain_b: &'repo FPChain<'repo>,
-) -> Result<Vec<Relation<'repo>>, GitBrustError> {
+) -> Result<Vec<Relation>, GitBrustError> {
     let branch_a_name = git::name_from_branch(fp_chain_a.branch)?;
     let branch_b_name = git::name_from_branch(fp_chain_b.branch)?;
     trace!(
@@ -173,7 +173,7 @@ fn detect_relation<'repo>(
     chain_no_merge_base: &mut std::iter::Peekable<std::slice::Iter<'repo, Commit<'repo>>>,
     merge_base_oid: Oid,
     current_commit_no_merge_base: Oid,
-) -> Result<Relation<'repo>, GitBrustError> {
+) -> Result<Relation, GitBrustError> {
     // Advance the iterator of the merge-base chain up to the merge-base
     while let Some(commit) = chain_merge_base.peek() {
         if commit.id() == merge_base_oid {
@@ -201,7 +201,6 @@ fn detect_relation<'repo>(
                 src: merge_base_oid,
                 dst: last_commit_before_change,
                 rel_type: RelationType::Merge,
-                repo,
             });
         }
         chain_no_merge_base.next();
@@ -211,7 +210,6 @@ fn detect_relation<'repo>(
         src: merge_base_oid,
         dst: last_commit_before_change,
         rel_type: RelationType::Birth,
-        repo,
     })
 }
 
