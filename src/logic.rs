@@ -177,15 +177,30 @@ fn detect_relation<'repo>(
     // Advance the iterator of the merge-base chain up to the merge-base
     while let Some(commit) = chain_merge_base.peek() {
         if commit.id() == merge_base_oid {
+            debug!("  Advanced to merge-base in its chain");
             break;
         }
+        trace!(
+            "  Advancing merge-base chain: {}",
+            repo.short_id_str(commit.id())
+        );
         chain_merge_base.next();
     }
     // Fix the iterator of the merge-base chain and iterate the other chain
     // calculating the merge-base until it changes
-    let last_commit_before_change = current_commit_no_merge_base;
+    let mut last_commit_before_change = current_commit_no_merge_base;
     while let Some(commit) = chain_no_merge_base.peek() {
+        trace!(
+            "  Checking commit in no-merge-base chain: {}",
+            repo.short_id_str(commit.id())
+        );
         let new_merge_base_oid = repo.merge_base(merge_base_oid, commit.id())?;
+        trace!(
+            "  Merge-base between {} and {} is {}",
+            repo.short_id_str(merge_base_oid),
+            repo.short_id_str(commit.id()),
+            repo.short_id_str(new_merge_base_oid)
+        );
         if new_merge_base_oid != merge_base_oid {
             // Merge-base changed, we found a relation
             trace!(
@@ -203,6 +218,10 @@ fn detect_relation<'repo>(
                 rel_type: RelationType::Merge,
             });
         }
+        // Update last seen commit before merge-base change
+        last_commit_before_change = commit.id();
+
+        trace!("  Advancing commit in no-merge-base chain");
         chain_no_merge_base.next();
     }
     // If we exit the loop without detecting a merge-base change, it's a branch birth
