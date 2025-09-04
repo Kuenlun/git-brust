@@ -67,13 +67,8 @@ impl Args {
     ) -> Result<Vec<Branch<'repo>>, GitBrustError> {
         let branches = if self.branches.is_empty() {
             trace!("No branches specified, using default branch with most merges");
-            match git::get_branch_with_more_merges(repo)? {
-                Some(branch) => vec![branch],
-                None => {
-                    trace!("No default branch found");
-                    vec![]
-                }
-            }
+            let branch_most_commits = git::get_branch_with_more_merges(repo)?;
+            git::get_recent_branches_excluding(repo, branch_most_commits, 2)?
         } else {
             trace!("Branches from args: {:?}", self.branches);
             git::branches_from_names(repo, &self.branches)?

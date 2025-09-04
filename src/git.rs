@@ -16,7 +16,7 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
-use git2::{Branch, BranchType, Commit, Repository};
+use git2::{Branch, BranchType, Commit, Oid, Repository};
 
 use crate::models::GitBrustError;
 
@@ -63,6 +63,125 @@ pub fn get_branch_with_more_merges<'repo>(
     }
 
     Ok(selected_branch)
+}
+
+/// Returns up to `count` recent local branches ordered for consumption:
+/// - If `exclude_branch` is provided, it is placed first in the output.
+/// - The remainder is filled with the most recent local branches by tip commit time,
+///   excluding the same branch by name or by tip Oid to avoid duplicates.
+/// - If there are fewer branches available, all available ones are returned.
+/// - If `count` is zero, an empty vector is returned.
+///
+/// Selection rules:
+/// - Unnamed branches are skipped from candidates since they cannot be referenced reliably.
+/// - Unborn branches are skipped from candidates because they have no tip commit time.
+/// - Sorting is by descending tip commit time (newest first).
+pub fn get_recent_branches_excluding<'repo>(
+    repo: &'repo Repository,
+    mut exclude_branch: Option<Branch<'repo>>,
+    count: usize,
+) -> Result<Vec<Branch<'repo>>, GitBrustError> {
+    debug!(
+        "Selecting up to {} recent branches with optional exclusion first",
+        count
+    );
+
+    if count == 0 {
+        trace!("Requested count is zero, returning empty selection");
+        return Ok(Vec::new());
+    }
+
+    // Resolve exclusion identity before moving it
+    let (excluded_name, excluded_tip): (Option<String>, Option<Oid>) = match exclude_branch.as_ref()
+    {
+        Some(b) => {
+            // Best-effort name resolution for equality checks
+            let name = b.name()?.map(|s| s.to_string());
+            // Tip Oid if present, to guard against renamed branches pointing to same tip
+            let tip = b.get().target();
+            (name, tip)
+        }
+        None => (None, None),
+    };
+
+    // Gather candidate branches with their tip times and names
+    // Only include valid, named, non-unborn branches
+    let mut candidates: Vec<(i64, Branch<'repo>, String, Oid)> = Vec::new();
+    let branches = repo.branches(Some(BranchType::Local))?;
+
+    for branch_result in branches {
+        let (branch, _ty) = branch_result?;
+
+        // Skip unnamed branches
+        let Some(name) = branch.name()?.map(|s| s.to_string()) else {
+            trace!("Skipping unnamed branch");
+            continue;
+        };
+
+        // Skip unborn branches
+        let Some(tip_oid) = branch.get().target() else {
+            trace!("Skipping unborn branch '{}'", name);
+            continue;
+        };
+
+        // Get tip commit time
+        let Some(tip_time) = tip_time_seconds(&branch)? else {
+            // Defensive: if there is a target but we failed to read time, skip
+            trace!("Skipping branch '{}' due to missing tip time", name);
+            continue;
+        };
+
+        // Exclude the branch that matches the provided exclusion by name or tip Oid
+        let exclude_by_name = excluded_name.as_deref() == Some(name.as_str());
+        let exclude_by_tip = excluded_tip.is_some() && excluded_tip == Some(tip_oid);
+        if exclude_by_name || exclude_by_tip {
+            trace!(
+                "Excluding branch '{}' from candidates (name match: {}, tip match: {})",
+                name, exclude_by_name, exclude_by_tip
+            );
+            continue;
+        }
+
+        trace!("{:>12} secs -> '{}' ({})", tip_time, name, tip_oid);
+        candidates.push((tip_time, branch, name, tip_oid));
+    }
+
+    // Sort by time descending, newest first
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+
+    // Build output: first the excluded branch if present, then fill with newest
+    let mut out: Vec<Branch<'repo>> = Vec::with_capacity(count);
+
+    if let Some(b) = exclude_branch.take() {
+        trace!("Placing excluded branch first in the result vector");
+        out.push(b);
+        if out.len() == count {
+            info!("Selection complete with only the excluded branch");
+            return Ok(out);
+        }
+    }
+
+    for (_time, branch, name, _oid) in candidates.into_iter() {
+        trace!("Adding branch '{}' to selection", name);
+        out.push(branch);
+        if out.len() == count {
+            break;
+        }
+    }
+
+    info!("Selected {} branch(es)", out.len());
+    Ok(out)
+}
+
+/// Helper: obtain the tip commit time (seconds since epoch) of a branch.
+/// Returns Ok(None) for unborn branches; propagates other git errors.
+fn tip_time_seconds(branch: &Branch) -> Result<Option<i64>, GitBrustError> {
+    let reference = branch.get();
+    match reference.peel_to_commit() {
+        Ok(commit) => Ok(Some(commit.time().seconds())),
+        Err(e) if e.code() == git2::ErrorCode::UnbornBranch => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Counts the number of merge commits in a branch's history.
