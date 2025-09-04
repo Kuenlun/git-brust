@@ -234,14 +234,22 @@ fn detect_relation<'repo>(
 
 #[cfg(test)]
 mod test {
+    use rand::{Rng, SeedableRng};
+    use rand_chacha::ChaCha8Rng;
+
     use super::*;
     use crate::models;
+    use crate::ui;
 
     #[test]
     fn test_empty_repo() -> Result<(), GitBrustError> {
         models::init_logger();
-        // Create a empty git repository
-        let (repo, _tmp) = test_utils::init_empty_repo_in_tempdir();
+
+        let b = test_utils::RepoBuilder::new_temp()?;
+
+        let fix = b.build();
+        let repo = &fix.repo;
+
         // Get local branches from the repo
         let branches = test_utils::get_local_repo_branches(&repo)?;
         assert!(branches.is_empty());
@@ -256,8 +264,12 @@ mod test {
     #[test]
     fn test_repo_only_one_commit() -> Result<(), GitBrustError> {
         models::init_logger();
-        // Create a basic git repository
-        let (repo, _tmp) = test_utils::init_repo_in_tempdir();
+
+        let mut b = test_utils::RepoBuilder::new_temp()?;
+        b.commit_on("master", "C1")?;
+
+        let fix = b.build();
+        let repo = &fix.repo;
 
         // Get local branches from the repo
         let branches = test_utils::get_local_repo_branches(&repo)?;
@@ -267,6 +279,47 @@ mod test {
 
         // Check it works even if the repo is empty
         assert!(relations.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn topo_random_robustness() -> Result<(), GitBrustError> {
+        models::init_logger();
+
+        let mut b = test_utils::RepoBuilder::new_temp()?;
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        // create N branches off master
+        b.commit_on("master", "C0")?;
+        let n = 5usize;
+        for i in 0..n {
+            let name = format!("b{}", i);
+            b.branch_from(&name, "master")?;
+            let k = 1 + rng.random_range(1..=4);
+            for j in 0..k {
+                b.commit_on(&name, &format!("{}-{}", name, j))?;
+            }
+        }
+
+        // random merges
+        for _ in 0..10 {
+            let a = format!("b{}", rng.random_range(0..n));
+            let c = format!("b{}", rng.random_range(0..n));
+            if a != c {
+                b.merge(&a, &c, &format!("merge {} -> {}", a, c))?;
+            }
+        }
+
+        let fix = b.build();
+        let repo = &fix.repo;
+
+        // Get local branches from the repo
+        let branches = test_utils::get_local_repo_branches(&repo)?;
+        assert!(!branches.is_empty());
+
+        let relations = run_logic(&repo, &branches)?;
+        ui::render(relations);
 
         Ok(())
     }

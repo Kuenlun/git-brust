@@ -16,50 +16,156 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
-use git2::{Branch, Oid, Repository, Signature};
+use git2::{Branch, Commit, Oid, Repository, Signature, Time, Tree};
 use log::info;
-use std::path::Path;
+use std::collections::HashMap;
+use tempfile::TempDir;
 
 use crate::git;
 use crate::models::GitBrustError;
 
-/// Assert that two paths are equal after canonicalization.
-fn assert_same_path(p1: &Path, p2: &Path) {
-    let err_msg = "failed to canonicalize";
-    let c1 = p1.canonicalize().expect(err_msg);
-    let c2 = p2.canonicalize().expect(err_msg);
-    assert_eq!(c1, c2);
+/// Temporary non-bare Git repository. Lives until dropped.
+pub struct RepoFixture {
+    pub repo: Repository,
+    _tmpdir: TempDir,
 }
 
-/// Initialize a repository and assert its working_dir matches the given path
-fn init_repo_assert_path_matches(path: &Path) -> Repository {
-    let repo = Repository::init(path).expect("failed to init repo");
-    assert_same_path(repo.workdir().unwrap(), path);
-    repo
+/// Deterministic signature for tests
+fn deterministic_sig() -> Signature<'static> {
+    let secs = 1_600_000_000; // 2020-09-13 12:26:40 UTC
+    let time = Time::new(secs, 0);
+    Signature::new("Test", "test@example.com", &time).expect("signature")
 }
 
-/// Create a temporary Git repository and return the Repository and TempDir
-pub fn init_empty_repo_in_tempdir() -> (Repository, tempfile::TempDir) {
-    let tmp = tempfile::tempdir().expect("failed to create tempdir");
-    let repo = init_repo_assert_path_matches(tmp.path());
-    (repo, tmp)
+/// Create an empty tree and return its OID
+fn empty_tree_oid(repo: &Repository) -> Result<Oid, git2::Error> {
+    let mut idx = repo.index()?;
+    idx.clear()?;
+    idx.write_tree()
 }
 
-pub fn init_repo_in_tempdir() -> (Repository, tempfile::TempDir) {
-    let (repo, tmp) = init_empty_repo_in_tempdir();
+/// Builder to construct deterministic repo topologies without touching the worktree
+pub struct RepoBuilder {
+    fix: RepoFixture,
+    empty_tree: Oid,
+    sig: Signature<'static>,
+    heads: HashMap<String, Oid>, // branch -> tip commit
+}
 
-    let tree_id = {
-        let mut index = repo.index().unwrap();
-        index.write_tree().unwrap()
-    };
-    {
-        let tree = repo.find_tree(tree_id).unwrap();
-        let sig = Signature::now("Test", "test@test.com").unwrap();
-        repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[])
-            .unwrap();
+impl RepoBuilder {
+    /// Create a new temporary non-bare repository with deterministic components
+    pub fn new_temp() -> Result<Self, GitBrustError> {
+        let tmp = TempDir::new()?;
+        let repo = Repository::init(tmp.path())?;
+        let empty_tree = empty_tree_oid(&repo)?;
+        Ok(Self {
+            fix: RepoFixture { repo, _tmpdir: tmp },
+            empty_tree,
+            sig: deterministic_sig(),
+            heads: HashMap::new(),
+        })
     }
 
-    (repo, tmp)
+    /// Get a `Tree` for the cached empty tree OID
+    fn empty_tree(&self) -> Result<Tree<'_>, git2::Error> {
+        self.fix.repo.find_tree(self.empty_tree)
+    }
+
+    /// Ensure a branch exists and optionally move it to `oid`
+    fn ensure_branch_at(&mut self, branch: &str, oid: Option<Oid>) -> Result<(), git2::Error> {
+        let reference = format!("refs/heads/{}", branch);
+        if let Some(to) = oid {
+            match self.fix.repo.find_reference(&reference) {
+                Ok(mut r) => {
+                    r.set_target(to, "move branch head")?;
+                }
+                Err(_) => {
+                    self.fix
+                        .repo
+                        .reference(&reference, to, true, "create branch")?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Create the initial commit on a branch, or append a new commit on top of its head
+    pub fn commit_on(&mut self, branch: &str, message: &str) -> Result<Oid, git2::Error> {
+        let oid = {
+            let parents: Vec<Commit> = match self.heads.get(branch) {
+                Some(&tip) => vec![self.fix.repo.find_commit(tip)?],
+                None => vec![],
+            };
+            let parents_refs: Vec<&Commit> = parents.iter().collect();
+
+            let tree = self.empty_tree()?;
+            let reference = format!("refs/heads/{}", branch);
+            self.fix.repo.commit(
+                Some(&reference),
+                &self.sig,
+                &self.sig,
+                message,
+                &tree,
+                &parents_refs,
+            )?
+        };
+
+        self.heads.insert(branch.to_string(), oid);
+        // Not strictly needed because commit already moved the ref
+        Ok(oid)
+    }
+
+    /// Create a new branch from an existing branch tip
+    pub fn branch_from(&mut self, new_branch: &str, from: &str) -> Result<(), git2::Error> {
+        let base = *self
+            .heads
+            .get(from)
+            .ok_or_else(|| git2::Error::from_str("base branch has no commits"))?;
+        self.ensure_branch_at(new_branch, Some(base))?;
+        self.heads.insert(new_branch.to_string(), base);
+        Ok(())
+    }
+
+    /// Create a merge commit on `target_branch` that merges `source_branch` into it
+    pub fn merge(
+        &mut self,
+        source_branch: &str,
+        target_branch: &str,
+        message: &str,
+    ) -> Result<Oid, git2::Error> {
+        let oid = {
+            let src = *self
+                .heads
+                .get(source_branch)
+                .ok_or_else(|| git2::Error::from_str("source branch missing"))?;
+            let dst = *self
+                .heads
+                .get(target_branch)
+                .ok_or_else(|| git2::Error::from_str("target branch missing"))?;
+
+            let p_src = self.fix.repo.find_commit(src)?;
+            let p_dst = self.fix.repo.find_commit(dst)?;
+            let parents = vec![&p_dst, &p_src]; // parent[0] = target, parent[1] = source
+
+            let tree = self.empty_tree()?;
+            let reference = format!("refs/heads/{}", target_branch);
+            self.fix.repo.commit(
+                Some(&reference),
+                &self.sig,
+                &self.sig,
+                message,
+                &tree,
+                &parents,
+            )?
+        };
+        self.heads.insert(target_branch.to_string(), oid);
+        Ok(oid)
+    }
+
+    /// Finalize and return the fixture
+    pub fn build(self) -> RepoFixture {
+        self.fix
+    }
 }
 
 pub fn get_local_repo_branches<'repo>(
@@ -74,114 +180,4 @@ pub fn get_local_repo_branches<'repo>(
         git::names_from_branches(&branches)?.join(", ")
     );
     Ok(branches)
-}
-
-/// Creates a new branch with the specified name
-pub fn create_branch<'repo>(
-    repo: &'repo Repository,
-    branch_name: &str,
-) -> Result<(), GitBrustError> {
-    // Get the current commit from HEAD
-    let head_commit = repo.head()?.peel_to_commit()?;
-
-    // Create the new branch pointing to the current commit
-    repo.branch(branch_name, &head_commit, false)?;
-
-    info!("Branch '{}' created successfully", branch_name);
-    Ok(())
-}
-
-/// Creates an empty commit on the specified branch
-pub fn add_commit_to_branch<'repo>(
-    repo: &'repo Repository,
-    branch_name: &str,
-) -> Result<Oid, GitBrustError> {
-    // Switch to the specified branch
-    let branch_ref_name = format!("refs/heads/{}", branch_name);
-
-    // Verify that the branch exists
-    let branch_ref = repo.find_reference(&branch_ref_name)?;
-    let branch_commit = branch_ref.peel_to_commit()?;
-
-    // Create an empty tree
-    let tree_id = {
-        let mut index = repo.index()?;
-        // If we want the commit to have the same content as the parent commit
-        // we can load the parent commit's tree into the index:
-        // index.read_tree(&branch_commit.tree()?)?;
-        index.write_tree()?
-    };
-    let tree = repo.find_tree(tree_id)?;
-
-    // Create a signature
-    let sig = Signature::now("Test User", "test@example.com")?;
-
-    // Create the commit on the specified branch
-    let commit_id = repo.commit(
-        Some(&branch_ref_name), // Update the branch reference
-        &sig,                   // author
-        &sig,                   // committer
-        "Empty commit",         // commit message
-        &tree,                  // tree
-        &[&branch_commit],      // parents - the previous commit on the branch
-    )?;
-
-    info!(
-        "Empty commit created in branch '{}': {}",
-        branch_name, commit_id
-    );
-    Ok(commit_id)
-}
-
-/// Convenience function that combines creating a branch and making a commit in it
-pub fn create_branch_and_commit<'repo>(
-    repo: &'repo Repository,
-    branch_name: &str,
-) -> Result<Oid, GitBrustError> {
-    // Create the branch
-    create_branch(repo, branch_name)?;
-
-    // Make a commit on the new branch
-    add_commit_to_branch(repo, branch_name)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_create_branch() {
-        let (repo, _temp) = init_repo_in_tempdir();
-
-        let result = create_branch(&repo, "test-branch");
-        assert!(result.is_ok());
-
-        // Verify that the branch was created
-        let branch = repo.find_branch("test-branch", git2::BranchType::Local);
-        assert!(branch.is_ok());
-    }
-
-    #[test]
-    fn test_add_commit_to_branch() {
-        let (repo, _temp) = init_repo_in_tempdir();
-
-        // First create a branch
-        create_branch(&repo, "test-branch").unwrap();
-
-        // Then make a commit on that branch
-        let result = add_commit_to_branch(&repo, "test-branch");
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_create_branch_and_commit() {
-        let (repo, _temp) = init_repo_in_tempdir();
-
-        let result = create_branch_and_commit(&repo, "new-branch");
-        assert!(result.is_ok());
-
-        // Verify that both the branch and commit were created
-        let branch = repo.find_branch("new-branch", git2::BranchType::Local);
-        assert!(branch.is_ok());
-    }
 }

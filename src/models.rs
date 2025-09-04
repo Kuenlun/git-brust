@@ -39,6 +39,9 @@ pub enum GitBrustError {
 
     #[error("branch does not have a valid name")]
     BranchNameInvalid,
+
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 static INIT: Once = Once::new();

@@ -159,12 +159,15 @@ mod tests {
     use super::*;
     use crate::models;
     use crate::test_utils;
-    use git2::{Signature, Time};
 
     #[test]
     fn test_get_branch_with_more_merges_empty_repo() -> Result<(), GitBrustError> {
         models::init_logger();
-        let (repo, _tmp) = test_utils::init_empty_repo_in_tempdir();
+
+        let b = test_utils::RepoBuilder::new_temp()?;
+
+        let fix = b.build();
+        let repo = &fix.repo;
 
         let result = get_branch_with_more_merges(&repo)?;
         assert!(result.is_none());
@@ -175,68 +178,24 @@ mod tests {
     fn test_selects_branch_with_most_merges() -> Result<(), GitBrustError> {
         models::init_logger();
 
-        let (repo, _tmp) = test_utils::init_empty_repo_in_tempdir();
+        let mut b = test_utils::RepoBuilder::new_temp()?;
+        // master: C1, C2, C3
+        b.commit_on("master", "C1")?;
+        b.commit_on("master", "C2")?;
+        b.commit_on("master", "C3")?;
 
-        // Setup: Create initial commit and tree
-        let signature = Signature::new("Test User", "test@example.com", &Time::new(0, 0))?;
-        let tree_id = {
-            let mut index = repo.index()?;
-            index.write_tree()?
-        };
-        let tree = repo.find_tree(tree_id)?;
+        // feature branched at C2: F1, F2
+        b.branch_from("feature", "master")?;
+        // Move feature to point at C2 explicitly if needed:
+        // b.ensure_branch_at("feature", b.head_of("master_at_C2"));
+        b.commit_on("feature", "F1")?;
+        b.commit_on("feature", "F2")?;
 
-        let initial_commit = repo.commit(
-            Some("HEAD"),
-            &signature,
-            &signature,
-            "Initial commit",
-            &tree,
-            &[],
-        )?;
+        // merge feature into master producing M1
+        b.merge("feature", "master", "M1")?;
 
-        // Create feature branch from initial commit
-        let initial_commit_obj = repo.find_commit(initial_commit)?;
-        let _feature_branch = repo.branch("feature", &initial_commit_obj, false)?;
-
-        // Switch to feature and create commits
-        repo.set_head("refs/heads/feature")?;
-        let mut last_commit = initial_commit_obj;
-        for i in 1..=3 {
-            let commit_id = repo.commit(
-                Some("HEAD"),
-                &signature,
-                &signature,
-                &format!("Feature commit {}", i),
-                &tree,
-                &[&last_commit],
-            )?;
-            last_commit = repo.find_commit(commit_id)?;
-        }
-
-        // Switch back to master and create merge commits
-        repo.set_head("refs/heads/master")?;
-        let master_commit = repo.find_commit(initial_commit)?;
-
-        // First merge commit
-        let merge_commit_id = repo.commit(
-            Some("HEAD"),
-            &signature,
-            &signature,
-            "Merge feature branch",
-            &tree,
-            &[&master_commit, &last_commit], // Two parents = merge commit
-        )?;
-
-        // Second merge commit
-        let merge_commit = repo.find_commit(merge_commit_id)?;
-        repo.commit(
-            Some("HEAD"),
-            &signature,
-            &signature,
-            "Another merge",
-            &tree,
-            &[&merge_commit, &last_commit], // Another merge
-        )?;
+        let fix = b.build();
+        let repo = &fix.repo;
 
         // Test: master should be selected (has 2 merges vs feature's 0)
         let result = get_branch_with_more_merges(&repo)?;
